@@ -2,6 +2,9 @@
 
 - 录入港口（航道基准水深）与潮高预报点；
 - 相邻预报点线性插值，在预报覆盖时段内求水深 >= 吃水 + 安全富余的连续窗口；
+  插值边界可落在整秒之间，裁剪允许范围、扣除预约占用与选最早时刻全程保留
+  原始亚秒边界，仅在响应输出或预约落库时向可行区间内收缩到微秒精度
+  （起点向上、终点向下；收缩后无可表达时刻时空窗口 / 409）；
 - 窗口结束时刻减去通航时长得到可出发时段，不足时长的窗口舍弃；
 - 查询窗口时实时读取最新预报数据计算，预报点更正后立即生效；
 - 单向航道预约：在请求的允许出发范围内，按最新预报安排最早出发时刻，
@@ -108,13 +111,14 @@ from .schemas import (
     WindowQueryResult,
 )
 from .tides import (
-    bookable_departure_windows,
+    bookable_departure_windows_ts,
     bridge_departure_windows,
     calibrated_forecast_points,
     departure_windows,
+    departure_windows_ts,
     depth_deficit_audit,
     earliest_feasible_departure,
-    earliest_scheduled_departure,
+    earliest_scheduled_departure_ts,
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
@@ -130,7 +134,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -682,7 +686,9 @@ def create_reservation(port_id: int, payload: ReservationCreate):
 
     基于该港口**最新预报**求可出发时段，与请求的允许出发范围取交集，
     再在其中安排**最早**、整个通航过程不与现有有效预约重叠的出发时刻
-    （两船首尾相接允许）。无可用时刻返回 409 且不写入。
+    （两船首尾相接允许）。裁剪、扣占用与选点全程保留插值得到的原始亚秒
+    边界，落库时刻才向上收缩到微秒精度（不早于真实达标边界）；收缩后无
+    可表达时刻返回 409 且不写入。
 
     同港口并发创建按港口串行化，并在 SQLite 立即写事务内原子地
     “检查 + 落库”，避免双重占用。
@@ -697,14 +703,15 @@ def create_reservation(port_id: int, payload: ReservationCreate):
             port = _get_port_or_404(db, port_id)
             points = _forecast_points(db, port_id)
             required_depth = payload.draft + payload.safety_margin
-            tide_windows, _ = departure_windows(
+            # 保留插值得到的原始边界（亚秒精度），裁剪允许范围与扣除占用前不取整
+            tide_windows = departure_windows_ts(
                 points,
                 reference_depth=port["reference_depth"],
                 required_depth=required_depth,
                 duration_seconds=payload.duration_minutes * 60,
             )
             blockers = _active_blockers(db, port_id)
-            departure = earliest_scheduled_departure(
+            departure = earliest_scheduled_departure_ts(
                 tide_windows,
                 duration_seconds=payload.duration_minutes * 60,
                 allowed_start=allowed_from,
@@ -830,7 +837,8 @@ def reschedule_reservation(
             points = _forecast_points(tx, port_id)
             required_depth = row["draft"] + row["safety_margin"]
             duration_seconds = row["duration_minutes"] * 60
-            tide_windows, _ = departure_windows(
+            # 保留原始边界直到选出最早时刻；返回时刻已向微秒网格收缩
+            tide_windows = departure_windows_ts(
                 points,
                 reference_depth=port["reference_depth"],
                 required_depth=required_depth,
@@ -838,7 +846,7 @@ def reschedule_reservation(
             )
             # 排除该预约自身原占用，只避让其他有效预约
             blockers = _active_blockers(tx, port_id, exclude_id=reservation_id)
-            departure = earliest_scheduled_departure(
+            departure = earliest_scheduled_departure_ts(
                 tide_windows,
                 duration_seconds=duration_seconds,
                 allowed_start=allowed_from,
@@ -945,7 +953,8 @@ def query_bookable_windows(
     duration_seconds = payload.duration_minutes * 60
 
     required_depth = payload.draft + payload.safety_margin
-    tide_windows, _ = departure_windows(
+    # 原始亚秒边界贯穿“相交允许范围 + 扣除占用”，仅输出时向微秒网格收缩
+    tide_windows = departure_windows_ts(
         points,
         reference_depth=port["reference_depth"],
         required_depth=required_depth,
@@ -953,7 +962,7 @@ def query_bookable_windows(
     )
     # 仅有效（未取消）预约占用航道；已取消预约不扣除
     blockers = _active_blockers(db, port_id)
-    windows = bookable_departure_windows(
+    windows = bookable_departure_windows_ts(
         tide_windows,
         duration_seconds=duration_seconds,
         allowed_start=allowed_from,

@@ -38,6 +38,13 @@
   进入，达到解除阈值的交点结束，交点作为边界；覆盖结束仍未解除标记未闭合；
   仅保留持续时长达到最短要求的时段，并给出期间极值潮高（高潮取最高、低潮
   取最低）。
+- 时间精度：裁剪允许范围、扣除预约占用、窗口相交与最早时刻选择全程保留插值
+  得到的原始（Unix 秒浮点）边界，绝不按整秒取整；仅在输出响应或落库时才把
+  每个时段向可行区间内**收缩到微秒精度**——起点取“时间戳不小于原始边界”的
+  最早微秒整点、终点取“时间戳不大于原始边界”的最晚微秒整点（以网格点
+  时间戳与原始 double 边界直接比较，不使用可能误判的固定容差带）；
+  收缩后起点晚于终点（含零长度单点不可表达）的时段丢弃；首尾相接与
+  单点出发均按未收缩的原始边界判定。
 - 分段航道通行时段：每段自带基准水深、相对出发时刻的进入偏移与正数通过
   时长；按各段基准水深复用达标窗口计算，减去通过时长得到该段全程达标的
   进入时段，再整体前移进入偏移反推为出发时段；所有段的出发时段取交集
@@ -47,7 +54,8 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import math
 
 _EPS = 1e-9  # 浮点容差，保证“恰好达标”的端点被纳入
 
@@ -115,15 +123,36 @@ def sufficient_depth_windows(
     return windows
 
 
-def _to_departure_windows(
+def _departure_windows_ts(
     windows_ts: list[tuple[float, float]], duration_seconds: float
-) -> list[tuple[datetime, datetime]]:
-    """达标窗口（Unix 秒）减去通航时长得到可出发时段；不足时长的窗口舍弃。"""
-    result: list[tuple[datetime, datetime]] = []
+) -> list[tuple[float, float]]:
+    """达标窗口（Unix 秒）减去通航时长得到可出发时段（原始浮点边界，不收缩）。
+
+    不足时长的窗口舍弃；窗口恰等于通航时长时退化为单点出发（零长度保留）。
+    """
+    result: list[tuple[float, float]] = []
     for start_ts, end_ts in windows_ts:
         if end_ts - start_ts >= duration_seconds - _EPS:
-            result.append((_to_utc(start_ts), _to_utc(end_ts - duration_seconds)))
+            result.append((start_ts, end_ts - duration_seconds))
     return result
+
+
+def departure_windows_ts(
+    points: list[ForecastPoint],
+    reference_depth: float,
+    required_depth: float,
+    duration_seconds: float,
+) -> list[tuple[float, float]]:
+    """全部可出发时段（原始 Unix 秒浮点边界，按时间升序），供排程链路复用。
+
+    不在此处做任何取整/收缩，保证裁剪允许范围、扣除预约占用与最早时刻
+    选择都基于插值得到的真实边界；输出/落库时由 shrink_windows_to_microseconds
+    统一向可行区间内收缩到微秒精度。
+    """
+    return _departure_windows_ts(
+        sufficient_depth_windows(points, reference_depth, required_depth),
+        duration_seconds,
+    )
 
 
 def departure_windows(
@@ -132,15 +161,18 @@ def departure_windows(
     required_depth: float,
     duration_seconds: float,
 ) -> tuple[list[tuple[datetime, datetime]], datetime | None]:
-    """计算全部可出发时段与最早出发时刻。
+    """计算全部可出发时段与最早出发时刻（输出前向可行区间收缩到微秒精度）。
 
-    返回 ([(start, end), ...], earliest)，时间均为 UTC datetime。
+    返回 ([(start, end), ...], earliest)，时间均为 UTC datetime；
+    原始窗口经微秒收缩后没有可表达时刻的时段被丢弃，全部不可表达时
+    返回 ([], None)。
     """
-    result = _to_departure_windows(
-        sufficient_depth_windows(points, reference_depth, required_depth),
-        duration_seconds,
+    result = shrink_windows_to_microseconds(
+        departure_windows_ts(
+            points, reference_depth, required_depth, duration_seconds
+        )
     )
-    earliest = min((w[0] for w in result), default=None)
+    earliest = result[0][0] if result else None
     return result, earliest
 
 
@@ -195,10 +227,12 @@ def bridge_departure_windows(
     clearance_windows = sufficient_depth_windows(
         [(t, -h) for t, h in points], bridge_bottom_elevation, required_clearance
     )
-    result = _to_departure_windows(
-        intersect_windows(depth_windows, clearance_windows), duration_seconds
+    result = shrink_windows_to_microseconds(
+        _departure_windows_ts(
+            intersect_windows(depth_windows, clearance_windows), duration_seconds
+        )
     )
-    earliest = min((w[0] for w in result), default=None)
+    earliest = result[0][0] if result else None
     return result, earliest
 
 
@@ -215,7 +249,8 @@ def earliest_feasible_departure(
     复用 sufficient_depth_windows 的插值规则求达标窗口（已限定在预报覆盖
     时段内），减通航时长得到可出发时段后再与允许出发范围取交集。交集在
     原始（Unix 秒）时间轴上完成，避免整秒取整把可行性边界外扩；仅返回的
-    展示时刻按既有约定四舍五入到整秒。无可行时刻返回 None。
+    时刻按微秒精度向上取整（收缩进可行区间内），避免落库/输出一个水深
+    不足的出发时刻。无可行时刻（含收缩后不可表达）返回 None。
     """
     lo, hi = allowed_start.timestamp(), allowed_end.timestamp()
     feasible: list[float] = []
@@ -226,7 +261,7 @@ def earliest_feasible_departure(
             departure = max(start_ts, lo)
             if departure <= min(end_ts - duration_seconds, hi) + _EPS:
                 feasible.append(departure)
-    return _to_utc(min(feasible)) if feasible else None
+    return _to_utc_ceil(min(feasible)) if feasible else None
 
 
 def max_supported_required_depth(
@@ -273,28 +308,31 @@ def max_supported_required_depth(
     return lo, departure
 
 
-def _remaining_departure_candidates(
-    departable_windows: list[tuple[datetime, datetime]],
+def remaining_departure_candidates_ts(
+    departable_windows_ts: list[tuple[float, float]],
     duration_seconds: float,
     allowed_start: datetime,
     allowed_end: datetime,
     blockers: list[tuple[datetime, datetime]],
 ) -> list[tuple[float, float]]:
-    """扣除已有预约占用后剩余的可出发区间（Unix 秒，按时间升序）。
+    """扣除已有预约占用后剩余的可出发区间（原始 Unix 秒浮点边界，按升序）。
 
     - 候选区间 = 潮汐可出发时段 ∩ 请求允许范围（含端点）；
     - 已有占用 [a, b] 会禁止 d ∈ (a-时长, b)：d == a-时长（首尾相接）
       与 d == b（紧随其后）均允许，因此从候选区间中挖掉开区间、保留两个端点；
     - 零长度区间（单个可出发时刻）保留；
-    - 每条占用最多把每个候选区间拆为左右两段，结果始终按时间升序。
+    - 全程按原始边界裁剪与扣除，不在此处取整；调用方在输出/落库前用
+      shrink_windows_to_microseconds 向可行区间内收缩到微秒精度。
+
+    每条占用最多把每个候选区间拆为左右两段，结果始终按时间升序。
     """
     range_lo, range_hi = allowed_start.timestamp(), allowed_end.timestamp()
 
-    # 候选出发区间 = 潮汐可出发时段 ∩ 请求允许范围
+    # 候选出发区间 = 潮汐可出发时段 ∩ 请求允许范围（原始边界直接相交）
     candidates: list[tuple[float, float]] = []
-    for start, end in departable_windows:
-        lo = max(start.timestamp(), range_lo)
-        hi = min(end.timestamp(), range_hi)
+    for start_ts, end_ts in departable_windows_ts:
+        lo = max(start_ts, range_lo)
+        hi = min(end_ts, range_hi)
         if lo <= hi:
             candidates.append((lo, hi))
 
@@ -328,10 +366,11 @@ def earliest_scheduled_departure(
     - blockers：该港口已有有效预约的通航占用区间 [占用起点, 占用终点]；
       首尾相接允许（新区间端点恰好贴住已有区间不算重叠）。
 
-    返回最早可出发时刻（UTC datetime）；无可用时刻返回 None。
+    原始边界上扣占用并选最早时刻，结果在落库前收缩为时间戳不小于该真实
+    最早时刻的微秒整点（不早于真实边界）；无可用时刻返回 None。
     """
-    candidates = _remaining_departure_candidates(
-        departable_windows,
+    candidates = remaining_departure_candidates_ts(
+        [(s.timestamp(), e.timestamp()) for s, e in departable_windows],
         duration_seconds,
         allowed_start,
         allowed_end,
@@ -339,7 +378,57 @@ def earliest_scheduled_departure(
     )
     if not candidates:
         return None
-    return _to_utc(min(lo for lo, _ in candidates))
+    return _to_utc_ceil(min(lo for lo, _ in candidates))
+
+
+def earliest_scheduled_departure_ts(
+    departable_windows_ts: list[tuple[float, float]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> datetime | None:
+    """与 earliest_scheduled_departure 相同，但入参为原始 Unix 秒可出发时段。
+
+    供创建/改期预约直接复用 departure_windows_ts 的原始窗口，避免经 datetime
+    转换提前丢失亚秒边界；返回的时刻仍向上取整到微秒精度。
+    """
+    candidates = remaining_departure_candidates_ts(
+        departable_windows_ts,
+        duration_seconds,
+        allowed_start,
+        allowed_end,
+        blockers,
+    )
+    if not candidates:
+        return None
+    return _to_utc_ceil(min(lo for lo, _ in candidates))
+
+
+def bookable_departure_windows_ts(
+    departable_windows_ts: list[tuple[float, float]],
+    duration_seconds: float,
+    allowed_start: datetime,
+    allowed_end: datetime,
+    blockers: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """入参为原始 Unix 秒可出发时段的可预约时段查询（输出收缩到微秒精度）。
+
+    与 earliest_scheduled_departure_ts 共用同一套原始边界扣除规则
+    （每条占用按请求通航时长换算为禁止出发开区间 (a-时长, b)，首尾相接
+    端点保留，零长度单点保留），返回前再统一向可行区间内收缩到微秒精度；
+    收缩后没有可表达时刻的时段丢弃。返回 [(start, end), ...]，按时间升序；
+    无可用时段时为空列表。
+    """
+    return shrink_windows_to_microseconds(
+        remaining_departure_candidates_ts(
+            departable_windows_ts,
+            duration_seconds,
+            allowed_start,
+            allowed_end,
+            blockers,
+        )
+    )
 
 
 def bookable_departure_windows(
@@ -353,18 +442,16 @@ def bookable_departure_windows(
 
     与 earliest_scheduled_departure 共用同一套扣除规则（按请求通航时长把每条
     占用 [a, b] 换算为禁止出发开区间 (a-时长, b)，首尾相接端点保留，零长度但
-    可用的单点出发时刻保留）。返回 [(start, end), ...]；无可用时段时为空列表。
+    可用的单点出发时刻保留）。入参为 datetime 窗口的便捷封装；输出前向可行
+    区间收缩到微秒精度，收缩后不可表达的时段丢弃；无可用时段时为空列表。
     """
-    return [
-        (_to_utc(lo), _to_utc(hi))
-        for lo, hi in _remaining_departure_candidates(
-            departable_windows,
-            duration_seconds,
-            allowed_start,
-            allowed_end,
-            blockers,
-        )
-    ]
+    return bookable_departure_windows_ts(
+        [(s.timestamp(), e.timestamp()) for s, e in departable_windows],
+        duration_seconds,
+        allowed_start,
+        allowed_end,
+        blockers,
+    )
 
 
 def merge_forecast_points(
@@ -767,9 +854,86 @@ def depth_deficit_audit(
     return deficits, uncovered
 
 
+def _split_seconds(ts: float) -> tuple[int, int]:
+    """Unix 秒拆为 (整数秒, 微秒 0..999999)；微秒部分按最近微秒取值。
+
+    datetime 只支持微秒精度，按最近微秒取整用于**展示型**输出（复核、预警
+    等只读时段）；排程/窗口输出改用 _to_utc_ceil/_to_utc_floor 向可行区间内
+    收缩。以整数秒为基准逐秒构造，避免 fromtimestamp 在大时间戳上的平台差异。
+    """
+    whole = int(math.floor(ts))
+    micro = int(round((ts - whole) * 1_000_000))
+    if micro == 1_000_000:
+        whole += 1
+        micro = 0
+    return whole, micro
+
+
 def _to_utc(ts: float) -> datetime:
-    """Unix 秒转 UTC datetime，四舍五入到整秒避免浮点噪声。"""
-    return datetime.fromtimestamp(round(ts), tz=timezone.utc)
+    """Unix 秒转 UTC datetime（展示型：按最近微秒取整，不向可行区间收缩）。"""
+    whole, micro = _split_seconds(ts)
+    return datetime.fromtimestamp(whole, tz=timezone.utc) + timedelta(microseconds=micro)
+
+
+def _to_utc_ceil(ts: float) -> datetime:
+    """不早于原始边界 ts 的最早微秒时刻（起点用：向可行区间内收缩）。
+
+    先按最近微秒取候选，再与原始 Unix 秒（同一 double 时间轴）直接比较：
+    候选早于真实边界则后推一微秒。以“网格点时间戳是否 >= 原始边界”为准，
+    而非固定容差带——插值、时长减法等不同来源的误差量级不同，直接比较既不会
+    把真实恰在微秒网格上的边界（计算可能带极小噪声）推后，也不会把真正落在
+    微秒之间的边界错误贴合到更晚（可能进入禁行区间）的网格点。
+    """
+    whole = int(math.floor(ts))
+    micro = int(round((ts - whole) * 1_000_000))
+    if micro == 1_000_000:
+        whole += 1
+        micro = 0
+    candidate = datetime.fromtimestamp(whole, tz=timezone.utc) + timedelta(
+        microseconds=micro
+    )
+    if candidate.timestamp() < ts:  # 候选早于真实边界：后推一微秒
+        candidate += timedelta(microseconds=1)
+    return candidate
+
+
+def _to_utc_floor(ts: float) -> datetime:
+    """不晚于原始边界 ts 的最晚微秒时刻（终点用：向可行区间内收缩）。
+
+    先按最近微秒取候选，再与原始 Unix 秒（同一 double 时间轴）直接比较：
+    候选晚于真实边界则前移一微秒（例如预约相接点 occ_start − 非整秒时长落在
+    微秒之间时，宁可前移也不跨入禁止出发的开区间）。
+    """
+    whole = int(math.floor(ts))
+    micro = int(round((ts - whole) * 1_000_000))
+    if micro == 1_000_000:
+        whole += 1
+        micro = 0
+    candidate = datetime.fromtimestamp(whole, tz=timezone.utc) + timedelta(
+        microseconds=micro
+    )
+    if candidate.timestamp() > ts:  # 候选晚于真实边界：前移一微秒
+        candidate -= timedelta(microseconds=1)
+    return candidate
+
+
+def shrink_windows_to_microseconds(
+    windows_ts: list[tuple[float, float]],
+) -> list[tuple[datetime, datetime]]:
+    """原始窗口（Unix 秒）向可行区间内收缩到微秒精度后转 UTC datetime。
+
+    起点向上取整（不早于真实达标边界）、终点向下取整（不晚于真实边界），
+    保证输出的任意出发时刻（含端点）在原始潮汐/占用约束下确实可行。
+    收缩后起点晚于终点的时段（含零长度单点落在两个微秒之间、无可表达时刻）
+    丢弃；起点恰等于终点（单点恰在微秒网格上）保留。结果仍按时间升序。
+    """
+    result: list[tuple[datetime, datetime]] = []
+    for lo, hi in windows_ts:
+        start = _to_utc_ceil(lo)
+        end = _to_utc_floor(hi)
+        if start <= end:
+            result.append((start, end))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1071,6 @@ def route_departure_windows(
         shifted = departed if shifted is None else intersect_windows(shifted, departed)
         if not shifted:
             break
-    result = [(_to_utc(s), _to_utc(e)) for s, e in (shifted or [])]
-    earliest = min((w[0] for w in result), default=None)
+    result = shrink_windows_to_microseconds(shifted or [])
+    earliest = result[0][0] if result else None
     return result, earliest

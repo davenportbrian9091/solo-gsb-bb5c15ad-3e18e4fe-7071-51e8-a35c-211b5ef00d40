@@ -1527,6 +1527,132 @@ def test_bookable_windows_validation_and_404(client):
 
 
 # ---------------------------------------------------------------------------
+# 时间精度：亚秒达标边界按微秒向可行区间收缩，创建/改期/bookable 复用同一窗口
+# ---------------------------------------------------------------------------
+
+
+def _setup_subsecond_port(client):
+    """水深在 0~100 秒由 4.9 升至 5.9，要求 4.914 时恰在 00:00:01.4 达标。
+
+    frac=(4.914-4.9)/(5.9-4.9)=0.014，段长 100 秒 → 交点 1.4 秒；
+    其后保持到 00:10:00。基准水深 4.0。
+    """
+    r = client.post("/ports", json={"name": "亚秒港", "reference_depth": 4.0})
+    port_id = r.json()["id"]
+    r = client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.9},
+            {"forecast_time": "2026-09-24T00:01:40Z", "tide_height": 1.9},
+            {"forecast_time": "2026-09-24T00:10:00Z", "tide_height": 1.9},
+        ]},
+    )
+    assert r.status_code == 200
+    return port_id
+
+
+def test_windows_contract_fractional_boundary_inward_to_microsecond(client):
+    port_id = _setup_subsecond_port(client)
+    r = client.post(
+        f"/ports/{port_id}/windows",
+        json={"draft": 0.914, "safety_margin": 4.0, "duration_minutes": 1},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # 真实达标起点 00:00:01.4：起点向可行区间收缩为 .400000，绝不四舍五入到第 1 秒
+    assert body["earliest_departure"] == "2026-09-24T00:00:01.400000+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:00:01.400000+00:00",
+         "end": "2026-09-24T00:09:00+00:00"}
+    ]
+
+
+def test_create_reservation_persists_microsecond_not_rounded_second(client):
+    port_id = _setup_subsecond_port(client)
+    body = {
+        "ship_name": "亚秒船",
+        "draft": 0.914,
+        "safety_margin": 4.0,
+        "duration_minutes": 1,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:10:00Z",
+    }
+    r = client.post(f"/ports/{port_id}/reservations", json=body)
+    assert r.status_code == 201
+    saved = r.json()
+    # 落库时刻必须在真实达标起点 1.4 秒（含）之后：1.400000，而非欠深的第 1 秒
+    assert saved["departure_start"] == "2026-09-24T00:00:01.400000+00:00"
+    assert saved["departure_end"] == "2026-09-24T00:01:01.400000+00:00"
+
+
+def test_create_reservation_409_when_only_sub_second_room_before_boundary(client):
+    port_id = _setup_subsecond_port(client)
+    # 允许范围止于真实起点前 0.00001 秒（1.39999）：第 1 秒虽在范围内但水深不足，
+    # 收缩后无可表达时刻 → 409 且不写入
+    body = {
+        "ship_name": "太早船",
+        "draft": 0.914,
+        "safety_margin": 4.0,
+        "duration_minutes": 1,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:01.399990Z",
+    }
+    r = client.post(f"/ports/{port_id}/reservations", json=body)
+    assert r.status_code == 409
+    assert client.get(f"/ports/{port_id}/reservations").json() == []
+
+
+def test_bookable_windows_contract_and_share_same_raw_window(client):
+    port_id = _setup_subsecond_port(client)
+    body = {
+        "draft": 0.914,
+        "safety_margin": 4.0,
+        "duration_minutes": 1,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:10:00Z",
+    }
+    r = client.post(f"/ports/{port_id}/bookable-windows", json=body)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["earliest_departure"] == "2026-09-24T00:00:01.400000+00:00"
+    assert data["windows"] == [
+        {"start": "2026-09-24T00:00:01.400000+00:00",
+         "end": "2026-09-24T00:09:00+00:00"}
+    ]
+
+    # 允许范围止于真实起点前 → 空窗口 + null（与创建预约的 409 判定一致）
+    body["allowed_departure_to"] = "2026-09-24T00:00:01.399990Z"
+    data = client.post(f"/ports/{port_id}/bookable-windows", json=body).json()
+    assert data["windows"] == []
+    assert data["earliest_departure"] is None
+
+
+def test_reschedule_persists_microsecond_boundary(client):
+    port_id = _setup_subsecond_port(client)
+    body = {
+        "ship_name": "改期船",
+        "draft": 0.914,
+        "safety_margin": 4.0,
+        "duration_minutes": 1,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:01.399990Z",
+    }
+    # 初始允许范围在真实起点之前 → 创建即 409；放到可达范围先建一条
+    body["allowed_departure_to"] = "2026-09-24T00:10:00Z"
+    rid = client.post(f"/ports/{port_id}/reservations", json=body).json()["id"]
+
+    # 改期回真实起点之前的范围 → 409，原排程保留
+    r = client.patch(
+        f"/reservations/{rid}/schedule",
+        json={"allowed_departure_from": "2026-09-24T00:00:00Z",
+              "allowed_departure_to": "2026-09-24T00:00:01.399990Z"},
+    )
+    assert r.status_code == 409
+    listed = client.get(f"/ports/{port_id}/reservations").json()
+    assert listed[0]["departure_start"] == "2026-09-24T00:00:01.400000+00:00"
+
+
+# ---------------------------------------------------------------------------
 # 桥梁净空通航窗口
 # PUT/GET /ports/{id}/bridge、POST /ports/{id}/bridge-windows
 # ---------------------------------------------------------------------------

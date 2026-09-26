@@ -7,17 +7,22 @@ from datetime import datetime, timedelta, timezone
 
 from app.tides import (
     bookable_departure_windows,
+    bookable_departure_windows_ts,
     bridge_departure_windows,
     calibrated_forecast_points,
     departure_windows,
+    departure_windows_ts,
     depth_deficit_audit,
     earliest_feasible_departure,
     earliest_scheduled_departure,
+    earliest_scheduled_departure_ts,
     intersect_windows,
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
+    remaining_departure_candidates_ts,
     route_departure_windows,
+    shrink_windows_to_microseconds,
     sufficient_depth_windows,
     tide_alert_periods,
 )
@@ -113,6 +118,155 @@ def test_window_clipped_at_forecast_coverage():
     # 全程达标时窗口就是预报覆盖时段本身，不外推
     windows = sufficient_depth_windows(pts(3, 4, 3), reference_depth=3.0, required_depth=5.0)
     assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=2)).timestamp())]
+
+
+# ---------------------------------------------------------------------------
+# 时间精度：原始（亚秒）边界贯穿裁剪/扣除/选点，输出按微秒向可行区间收缩
+# ---------------------------------------------------------------------------
+
+
+def _off_grid_tide_points():
+    """水深在 0~100 秒段由 4.9 升至 5.9，要求 4.914 时恰在 1.4 秒达标。
+
+    frac = (4.914-4.9)/(5.9-4.9) = 0.014，段长 100 秒 → 交点 1.4 秒；
+    其后保持水深 5.9 至 600 秒。
+    """
+    return [
+        (BASE, 0.9),
+        (BASE + timedelta(seconds=100), 1.9),
+        (BASE + timedelta(seconds=600), 1.9),
+    ]
+
+
+def test_sufficient_window_keeps_fractional_second_boundary():
+    windows = sufficient_depth_windows(
+        _off_grid_tide_points(), reference_depth=4.0, required_depth=4.914
+    )
+    assert len(windows) == 1
+    # 原始边界保留为 1.4 秒，绝不取整为第 1 秒
+    assert abs(windows[0][0] - (BASE + timedelta(seconds=1.4)).timestamp()) < 1e-6
+    assert windows[0][1] == (BASE + timedelta(seconds=600)).timestamp()
+
+
+def test_departure_window_contracts_fractional_start_inward_to_microsecond():
+    # 可出发时段真实起点 1.4 秒、终点 540 秒；60 秒通航
+    points = _off_grid_tide_points()
+    raw = departure_windows_ts(points, 4.0, 4.914, 60)
+    assert abs(raw[0][0] - (BASE + timedelta(seconds=1.4)).timestamp()) < 1e-6
+    assert raw[0][1] == (BASE + timedelta(seconds=540)).timestamp()
+
+    deps, earliest = departure_windows(points, 4.0, 4.914, 60)
+    # 起点向可行区间内收缩到微秒：1.400000，而不是欠深的第 1 秒
+    assert earliest == BASE + timedelta(seconds=1, microseconds=400000)
+    assert deps == [
+        (
+            BASE + timedelta(seconds=1, microseconds=400000),
+            BASE + timedelta(seconds=540),
+        )
+    ]
+
+
+def test_departure_window_end_between_grid_seconds_contracts_downward():
+    # 终点交点取真正落在微秒之间的 100.7123454 秒（段 200~700 下降），
+    # 通航 60 秒 → 可出发终点 240.7123454 秒，向下严格取整为 240.712345
+    frac = 100.7123454 / 500
+    d1 = (5.0 - (1 - frac) * 5.5) / frac
+    points = [
+        (BASE, 1.5),
+        (BASE + timedelta(seconds=200), 1.5),
+        (BASE + timedelta(seconds=700), d1 - 4.0),
+    ]
+    deps, earliest = departure_windows(points, 4.0, 5.0, 60)
+    assert earliest == BASE
+    assert deps[0][0] == BASE
+    assert deps[0][1] == BASE + timedelta(seconds=240, microseconds=712345)
+
+
+def test_range_ending_before_fractional_start_has_no_expressible_time():
+    # 允许范围止于真实起点 1.4 秒之前 0.01 秒（1.39999）：第 1 秒虽在范围内
+    # 但水深不足；收缩后无可表达时刻 → 空窗口 / None（旧整秒取整会误排第 1 秒）
+    points = _off_grid_tide_points()
+    raw = departure_windows_ts(points, 4.0, 4.914, 60)
+    end = BASE + timedelta(seconds=1, microseconds=399990)  # 1.39999 秒
+    candidates = remaining_departure_candidates_ts(raw, 60, BASE, end, [])
+    assert shrink_windows_to_microseconds(candidates) == []
+    assert (
+        earliest_scheduled_departure_ts(raw, 60, BASE, end, []) is None
+    )
+
+
+def test_fractional_start_on_grid_single_point_kept():
+    # 允许范围恰止于真实起点 1.4 秒（端点纳入）：微秒网格上的单点出发保留
+    points = _off_grid_tide_points()
+    raw = departure_windows_ts(points, 4.0, 4.914, 60)
+    start_point = BASE + timedelta(seconds=1, microseconds=400000)
+    candidates = remaining_departure_candidates_ts(raw, 60, BASE, start_point, [])
+    assert shrink_windows_to_microseconds(candidates) == [(start_point, start_point)]
+
+
+def test_touching_at_fractional_boundary_kept_by_raw_boundary():
+    # 占用 [61.4, 120]（60 秒通航）→ 禁止出发 (1.4, 120)：左侧 1.4 的首尾相接
+    # 单点按真实边界保留（微秒网格上），右侧 [120, 540] 紧随其后也保留
+    points = _off_grid_tide_points()
+    raw = departure_windows_ts(points, 4.0, 4.914, 60)
+    blockers = [
+        (
+            BASE + timedelta(seconds=61, microseconds=400000),
+            BASE + timedelta(seconds=120),
+        )
+    ]
+    windows = bookable_departure_windows_ts(
+        raw, 60, BASE, BASE + timedelta(seconds=600), blockers
+    )
+    touch = BASE + timedelta(seconds=1, microseconds=400000)
+    assert windows[0] == (touch, touch)  # 零长度首尾相接单点
+    assert windows[1] == (BASE + timedelta(seconds=120), BASE + timedelta(seconds=540))
+
+
+def test_window_shorter_than_one_microsecond_after_clip_is_dropped():
+    # 真实起点 1.4002005 秒（落在微秒 1.400200 与 1.400201 之间）：允许范围
+    # 恰止于其前一个微秒整点 1.400200（含端点）时，区间内没有可行的可表达
+    # 时刻（该网格点早于真实起点，水深不足）→ 空窗口 / None；止于下一个微秒
+    # 整点 1.400201（晚于真实起点）时保留该单点。
+    required = 4.9 + 0.014002005  # frac=0.014002005、段长 100 → 交点 1.4002005 秒
+    points = [
+        (BASE, 0.9),
+        (BASE + timedelta(seconds=100), 1.9),
+        (BASE + timedelta(seconds=600), 1.9),
+    ]
+    raw = departure_windows_ts(points, 4.0, required, 60)
+    before = BASE + timedelta(seconds=1, microseconds=400200)
+    assert shrink_windows_to_microseconds(
+        remaining_departure_candidates_ts(raw, 60, BASE, before, [])
+    ) == []
+    assert earliest_scheduled_departure_ts(raw, 60, BASE, before, []) is None
+
+    after = BASE + timedelta(seconds=1, microseconds=400201)
+    assert shrink_windows_to_microseconds(
+        remaining_departure_candidates_ts(raw, 60, BASE, after, [])
+    ) == [(after, after)]
+
+
+def test_touching_point_with_fractional_duration_never_inside_blocker():
+    # 非整秒通航时长 D（分钟换算出的非整秒）使“与上一条预约首尾相接”的真实
+    # 出发时刻 occ_start − D 落在微秒之间。扣占用保留该开区间端点后，输出向
+    # 可行区间收缩时必须取**不晚于**该真实相接点的微秒时刻，绝不能贴合到更晚
+    # 的微秒整点而落入禁止出发开区间 (occ_start − D, occ_end)。
+    duration = 740.7  # 秒（非整秒）
+    # 潮汐可出发时段足够宽 [0, 4000]
+    tide = [(BASE.timestamp(), (BASE + timedelta(seconds=4000)).timestamp())]
+    occ_start = BASE + timedelta(seconds=3600)
+    occ_end = occ_start + timedelta(seconds=600)
+    windows = bookable_departure_windows_ts(
+        tide, duration, BASE, BASE + timedelta(seconds=4000),
+        [(occ_start, occ_end)],
+    )
+    touch_raw = occ_start.timestamp() - duration  # 2859.29999995…，在微秒之间
+    # 左侧窗口终点即相接点收缩结果
+    left_end = windows[0][1]
+    assert left_end.timestamp() <= touch_raw
+    # 且不得落在禁止开区间内：left_end + duration 必须 <= occ_start
+    assert left_end.timestamp() + duration <= occ_start.timestamp() + 1e-9
 
 
 # ---------------------------------------------------------------------------
