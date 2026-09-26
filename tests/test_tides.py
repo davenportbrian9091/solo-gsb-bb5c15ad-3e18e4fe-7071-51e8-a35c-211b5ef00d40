@@ -5,18 +5,24 @@ import time
 from bisect import bisect_right
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.tides import (
+    _to_utc,
     bookable_departure_windows,
     bridge_departure_windows,
     calibrated_forecast_points,
     departure_windows,
+    departure_windows_ts,
     depth_deficit_audit,
     earliest_feasible_departure,
     earliest_scheduled_departure,
+    earliest_scheduled_departure_ts,
     intersect_windows,
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
+    quantize_window,
     route_departure_windows,
     sufficient_depth_windows,
     tide_alert_periods,
@@ -113,6 +119,142 @@ def test_window_clipped_at_forecast_coverage():
     # 全程达标时窗口就是预报覆盖时段本身，不外推
     windows = sufficient_depth_windows(pts(3, 4, 3), reference_depth=3.0, required_depth=5.0)
     assert windows == [(BASE.timestamp(), (BASE + timedelta(hours=2)).timestamp())]
+
+
+# ---------------------------------------------------------------------------
+# 微秒精度：插值边界落在整秒/微秒之间时向可行区间内收缩
+# ---------------------------------------------------------------------------
+
+
+def _crossing_at_1400ms_points(three_points: bool = False):
+    """基准 3、所需水深 5：上升段恰在 BASE + 1.400000 秒处达标的预报。
+
+    0.0 秒潮高 0（水深 3），10 秒潮高 2/0.14（水深 3 + 2/0.14），
+    线性插值下水深 5 的交点 frac = 2 / (2/0.14) = 0.14 → 1.4 秒（微秒网格上）。
+    three_points=True 时追加 20 秒潮高 0，形成 [1.4, 18.6] 的完整达标窗口。
+    """
+    points = [(BASE, 0.0), (BASE + timedelta(seconds=10), 2.0 / 0.14)]
+    if three_points:
+        points.append((BASE + timedelta(seconds=20), 0.0))
+    return points
+
+
+def test_fractional_second_boundary_kept_raw_then_ceiled_to_microsecond():
+    # 旧实现把 1.4 秒起点四舍五入成第 1 秒；新实现保留原始边界，
+    # 输出时向上收缩到 1.400000 秒（恰在微秒网格上保留），绝不外扩到第 1 秒
+    raw = departure_windows_ts(
+        _crossing_at_1400ms_points(), 3.0, 5.0, duration_seconds=0
+    )
+    assert len(raw) == 1
+    assert raw[0][0] == pytest.approx(BASE.timestamp() + 1.4, abs=1e-6)
+    deps, earliest = departure_windows(
+        _crossing_at_1400ms_points(), 3.0, 5.0, duration_seconds=0
+    )
+    assert earliest == BASE + timedelta(seconds=1, microseconds=400000)
+    assert deps[0][0] == earliest
+
+
+def test_fractional_second_boundary_rounding_never_extends_feasible_region():
+    # 允许范围恰结束在 1.399999 秒：真实起点 1.4 秒在范围外 → 无可行时刻，
+    # 旧实现四舍五入到第 1 秒会误判可行
+    dep = earliest_feasible_departure(
+        _crossing_at_1400ms_points(), 3.0, 5.0, duration_seconds=0,
+        allowed_start=BASE,
+        allowed_end=BASE + timedelta(seconds=1, microseconds=399999),
+    )
+    assert dep is None
+    # 结束在 1.4 秒（真实边界，含端点）→ 可行且输出 1.400000 秒
+    dep = earliest_feasible_departure(
+        _crossing_at_1400ms_points(), 3.0, 5.0, duration_seconds=0,
+        allowed_start=BASE,
+        allowed_end=BASE + timedelta(seconds=1, microseconds=400000),
+    )
+    assert dep == BASE + timedelta(seconds=1, microseconds=400000)
+
+
+def test_fractional_end_boundary_floored_to_microsecond():
+    # 达标窗口终点恰在第 10 秒（预报点恰好达标），通航 8.5000005 秒：
+    # 可出发终点 1.4999995…（夹在 1.499999 与 1.500000 之间，2 ULP 数值噪声
+    # 不归并到 1.5），输出向下收缩为 1.499999，绝不外扩到 1.5
+    points = [
+        (BASE, 3.0),
+        (BASE + timedelta(seconds=10), 2.0),
+        (BASE + timedelta(seconds=11), 0.0),
+    ]
+    deps, earliest = departure_windows(points, 3.0, 5.0, duration_seconds=8.5000005)
+    assert deps == [
+        (BASE, BASE + timedelta(seconds=1, microseconds=500000)),
+    ]
+
+
+def test_non_expressible_clipped_window_dropped():
+    # 用允许范围把可出发时段裁剪成“真实区间内没有任何微秒整点”的缝隙：
+    # 真实起点 1.4 秒；允许范围 (1.400000, 1.400001) 内没有可表达时刻 → 空
+    raw = departure_windows_ts(
+        _crossing_at_1400ms_points(three_points=True), 3.0, 5.0,
+        duration_seconds=0,
+    )
+    dep = earliest_scheduled_departure_ts(
+        raw, 0,
+        allowed_start=BASE + timedelta(seconds=1, microseconds=400000)
+        + timedelta(microseconds=1),
+        allowed_end=BASE + timedelta(seconds=1, microseconds=400001)
+        - timedelta(microseconds=1),
+        blockers=[],
+    )
+    # 下界 1.4000001、上界 1.4000009，区间内没有微秒整点
+    assert dep is None
+    # 上界延伸到微秒整点 1.400001 后该点可行（向内收缩，不回退到 1.4）
+    dep = earliest_scheduled_departure_ts(
+        raw, 0,
+        allowed_start=BASE + timedelta(seconds=1, microseconds=400001),
+        allowed_end=BASE + timedelta(seconds=1, microseconds=400001),
+        blockers=[],
+    )
+    assert _to_utc(dep) == BASE + timedelta(seconds=1, microseconds=400001)
+
+
+def test_blocker_touching_fractional_boundary_keeps_touching_point():
+    # 首尾相接按原始边界判定：已有占用起点恰为“真实起点 + 10 秒”时，
+    # 禁止出发开区间的左端恰等于真实起点，该点保留并收缩为 1.400000 秒
+    duration = 10
+    raw = departure_windows_ts(
+        _crossing_at_1400ms_points(three_points=True), 3.0, 5.0,
+        duration_seconds=duration,
+    )
+    touching_start = _to_utc(raw[0][0] + duration)
+    blockers = [(touching_start, _to_utc(raw[0][0] + duration + 1))]
+    dep = earliest_scheduled_departure_ts(
+        raw, duration, BASE, BASE + timedelta(hours=2), blockers
+    )
+    assert dep is not None
+    assert _to_utc(dep) == BASE + timedelta(seconds=1, microseconds=400000)
+    # 占用再提前 1 微秒：真实起点落入开区间内部，1.400000 与 1.400001 均被禁止
+    blockers = [
+        (
+            _to_utc(raw[0][0] + duration - 0.000001),
+            _to_utc(raw[0][0] + duration + 1),
+        )
+    ]
+    dep = earliest_scheduled_departure_ts(
+        raw, duration, BASE, BASE + timedelta(hours=2), blockers
+    )
+    assert dep is None or _to_utc(dep) >= BASE + timedelta(
+        seconds=1, microseconds=400002
+    )
+
+
+def test_quantize_window_shrinks_inward_and_drops_empty():
+    from app.tides import quantize_window
+
+    # 向内部收缩：起点向上、终点向下
+    assert quantize_window(1.2000001, 3.9) == (1.200001, 3.9)
+    assert quantize_window(1.2, 3.9000009) == (1.2, 3.9)
+    # 恰在微秒网格上的端点保留
+    assert quantize_window(1.000001, 1.000001) == (1.000001, 1.000001)
+    # 区间内没有可表达时刻（含不可表达单点）→ None
+    assert quantize_window(1.0000005, 1.0000005) is None
+    assert quantize_window(1.0000007, 1.0000013) == (1.000001, 1.000001)
 
 
 # ---------------------------------------------------------------------------

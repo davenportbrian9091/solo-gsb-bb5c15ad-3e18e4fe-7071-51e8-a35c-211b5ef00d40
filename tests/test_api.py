@@ -2037,3 +2037,164 @@ def test_route_windows_query_is_read_only(client):
     # 查询只读：预报点不变
     forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
     assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]
+
+
+# ---------------------------------------------------------------------------
+# 微秒精度：达标边界落在整秒之间时向可行区间内收缩（不四舍五入外扩）
+# ---------------------------------------------------------------------------
+
+
+def _setup_subsecond_port(client):
+    """基准水深 3.0；00:00:00 水深 3.0（不足）、00:00:10 水深 3+2/0.14、
+    00:00:20 水深 3.0：所需水深 5.0 的上升交点恰在 00:00:01.400000，
+    下降交点在 00:00:18.600000，达标窗口 [1.400000, 18.600000]。"""
+    r = client.post("/ports", json={"name": "微秒港", "reference_depth": 3.0})
+    port_id = r.json()["id"]
+    r = client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [
+            {"forecast_time": "2026-09-24T00:00:00Z", "tide_height": 0.0},
+            {"forecast_time": "2026-09-24T00:00:10Z", "tide_height": 2.0 / 0.14},
+            {"forecast_time": "2026-09-24T00:00:20Z", "tide_height": 0.0},
+        ]},
+    )
+    assert r.status_code == 200
+    return port_id
+
+
+def test_windows_subsecond_boundary_shrinks_inward(client):
+    port_id = _setup_subsecond_port(client)
+    r = client.post(
+        f"/ports/{port_id}/windows",
+        json={"draft": 5.0, "safety_margin": 0.0, "duration_minutes": 1 / 6},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # 旧实现四舍五入会返回起点 00:00:01（水深不足）；新实现向内收缩
+    assert body["earliest_departure"] == "2026-09-24T00:00:01.400000+00:00"
+    assert body["windows"] == [
+        {
+            "start": "2026-09-24T00:00:01.400000+00:00",
+            "end": "2026-09-24T00:00:08.600000+00:00",
+        }
+    ]
+
+
+def test_reservation_range_ending_before_ceil_boundary_returns_409(client):
+    port_id = _setup_subsecond_port(client)
+    # 允许范围结束在真实起点 1.400000 之前 1 微秒：无可行时刻 → 409，不写入
+    body = {
+        "ship_name": "微秒号",
+        "draft": 5.0,
+        "safety_margin": 0.0,
+        "duration_minutes": 1 / 6,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:01.399999Z",
+    }
+    r = client.post(f"/ports/{port_id}/reservations", json=body)
+    assert r.status_code == 409
+    assert client.get(f"/ports/{port_id}/reservations").json() == []
+
+
+def test_reservation_created_at_ceiled_microsecond_inside_feasible_region(client):
+    port_id = _setup_subsecond_port(client)
+    body = {
+        "ship_name": "微秒号",
+        "draft": 5.0,
+        "safety_margin": 0.0,
+        "duration_minutes": 1 / 6,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:20Z",
+    }
+    r = client.post(f"/ports/{port_id}/reservations", json=body)
+    assert r.status_code == 201
+    saved = r.json()
+    # 落库时刻是向内收缩后的 01.400000，绝不是旧实现的 01.000000
+    assert saved["departure_start"] == "2026-09-24T00:00:01.400000+00:00"
+    assert saved["departure_end"] == "2026-09-24T00:00:11.400000+00:00"
+    # 复核排定的通航区间：01.400000 处水深恰好达标，全程 sufficient
+    audit = client.get(f"/reservations/{saved['id']}/depth-audit").json()
+    assert audit["sufficient"] is True
+    assert audit["deficits"] == []
+    assert audit["uncovered"] == []
+
+
+def test_reschedule_shrinks_subsecond_boundary(client):
+    port_id = _setup_subsecond_port(client)
+    body = {
+        "ship_name": "微秒号",
+        "draft": 5.0,
+        "safety_margin": 0.0,
+        "duration_minutes": 1 / 6,
+        "allowed_departure_from": "2026-09-24T00:00:08Z",
+        "allowed_departure_to": "2026-09-24T00:00:20Z",
+    }
+    r = client.post(f"/ports/{port_id}/reservations", json=body)
+    assert r.status_code == 201
+    rid = r.json()["id"]
+    # 改期到预报窗口开头：新范围结束在真实起点之前 → 409，原排程保留
+    r409 = client.patch(
+        f"/reservations/{rid}/schedule",
+        json={
+            "allowed_departure_from": "2026-09-24T00:00:00Z",
+            "allowed_departure_to": "2026-09-24T00:00:01.399999Z",
+        },
+    )
+    assert r409.status_code == 409
+    kept = client.get(f"/ports/{port_id}/reservations").json()[0]
+    assert kept["departure_start"] == "2026-09-24T00:00:08+00:00"
+    # 新范围覆盖真实起点（含）→ 改期成功，落库 01.400000
+    r = client.patch(
+        f"/reservations/{rid}/schedule",
+        json={
+            "allowed_departure_from": "2026-09-24T00:00:00Z",
+            "allowed_departure_to": "2026-09-24T00:00:20Z",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["departure_start"] == "2026-09-24T00:00:01.400000+00:00"
+    assert r.json()["departure_end"] == "2026-09-24T00:00:11.400000+00:00"
+
+
+def test_bookable_windows_subsecond_boundary_and_empty_gap(client):
+    port_id = _setup_subsecond_port(client)
+    query = {
+        "draft": 5.0,
+        "safety_margin": 0.0,
+        "duration_minutes": 1 / 6,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:20Z",
+    }
+    body = client.post(f"/ports/{port_id}/bookable-windows", json=query).json()
+    assert body["earliest_departure"] == "2026-09-24T00:00:01.400000+00:00"
+    assert body["windows"] == [
+        {
+            "start": "2026-09-24T00:00:01.400000+00:00",
+            "end": "2026-09-24T00:00:08.600000+00:00",
+        }
+    ]
+    # 允许范围只覆盖真实起点这一个点（恰在微秒网格上）→ 单点窗口保留
+    point_query = {
+        **query,
+        "allowed_departure_from": "2026-09-24T00:00:01.400000Z",
+        "allowed_departure_to": "2026-09-24T00:00:01.400000Z",
+    }
+    body = client.post(f"/ports/{port_id}/bookable-windows", json=point_query).json()
+    assert body["earliest_departure"] == "2026-09-24T00:00:01.400000+00:00"
+    assert body["windows"] == [
+        {
+            "start": "2026-09-24T00:00:01.400000+00:00",
+            "end": "2026-09-24T00:00:01.400000+00:00",
+        }
+    ]
+    # 允许范围上界严格早于真实起点（1.400000095…），又不包含其向上收缩后的
+    # 首个整点 1.400000：交集内没有任何可表达时刻 → 空窗口、earliest 为 null。
+    # 旧实现把起点四舍五入成整秒 01，会错误地返回该时刻。
+    empty_query = {
+        **query,
+        "allowed_departure_from": "2026-09-24T00:00:00Z",
+        "allowed_departure_to": "2026-09-24T00:00:01.399999Z",
+    }
+    body = client.post(f"/ports/{port_id}/bookable-windows", json=empty_query).json()
+    assert body["earliest_departure"] is None
+    assert body["windows"] == []
